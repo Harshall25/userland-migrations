@@ -3,6 +3,7 @@ import type Js from '@codemod.com/jssg-types/langs/javascript';
 import { getModuleDependencies } from '@nodejs/codemod-utils/ast-grep/module-dependencies';
 import { resolveBindingPath } from '@nodejs/codemod-utils/ast-grep/resolve-binding-path';
 import { detectIndentUnit, getLineIndent } from '@nodejs/codemod-utils/ast-grep/indent';
+import { EOL } from 'node:os';
 
 const STREAM_CLASSES = [
 	'Writable', 'Readable', 'Transform', 'Duplex', 'PassThrough',
@@ -60,7 +61,6 @@ type Replacement = { start: number; end: number; text: string };
 
 type FileContext = {
 	source: string;
-	eol: string;
 	indentUnit: string;
 };
 
@@ -89,7 +89,6 @@ export default function transform(root: SgRoot<Js>): string | null {
 	const source = rootNode.text();
 	const context: FileContext = {
 		source,
-		eol: source.includes('\r\n') ? '\r\n' : '\n',
 		indentUnit: detectIndentUnit(source),
 	};
 
@@ -128,7 +127,7 @@ function getStreamClassNames(root: SgRoot<Js>): Set<string> {
 }
 
 //find methods in the stream classes
-function findStreamFunctions(rootNode: SgNode<Js>, streamNames: Set<string>,): StreamFunction[] {
+function findStreamFunctions(rootNode: SgNode<Js>, streamNames: Set<string>): StreamFunction[] {
 	const found: StreamFunction[] = [];
 	const methods = rootNode.findAll({ rule: { kind: 'method_definition' } });
 
@@ -154,8 +153,7 @@ function findStreamFunctions(rootNode: SgNode<Js>, streamNames: Set<string>,): S
 		const value = pair.field('value');
 		if (!key || !value) continue;
 
-		const name = key.text().replace(/^(['"])(.*)\1$/, '$2');
-
+		const name = key.find({ rule: { kind: 'string_fragment' } })?.text() ?? key.text();
 		if (
 			OPTION_METHODS.has(name) &&
 			FUNCTION_VALUE_KINDS.has(value.kind()) &&
@@ -171,7 +169,7 @@ function findStreamFunctions(rootNode: SgNode<Js>, streamNames: Set<string>,): S
 //check if a class method belongs to a class that extends one of stream classes
 function extendsStream(member: SgNode<Js>, streamNames: Set<string>): boolean {
 	const classBody = member.parent();
-	if (classBody?.kind() !== 'class_body') return false;
+	if (!classBody?.is('class_body')) return false;
 
 	const classNode = classBody.parent();
 	if (!classNode) return false;
@@ -179,22 +177,22 @@ function extendsStream(member: SgNode<Js>, streamNames: Set<string>): boolean {
 	const heritage = classNode.find({ rule: { kind: 'class_heritage' } });
 	if (!heritage) return false;
 
-	const parts = heritage.children().filter((c) => c.kind() !== 'extends');
+	const parts = heritage.children().filter((c) => !c.is('extends'));
 	const superclass = parts[parts.length - 1];
 
 	return !!superclass && streamNames.has(withoutSpaces(superclass.text()));
 }
 
 // Checks if an object method property belongs to options passed
-function isStreamOptionsMember(member: SgNode<Js>, streamNames: Set<string>,): boolean {
+function isStreamOptionsMember(member: SgNode<Js>, streamNames: Set<string>): boolean {
 	const object = member.parent();
-	if (object?.kind() !== 'object') return false;
+	if (!object?.is('object')) return false;
 
 	const args = object.parent();
-	if (args?.kind() !== 'arguments') return false;
+	if (!args?.is('arguments')) return false;
 
 	const newExpression = args.parent();
-	if (newExpression?.kind() !== 'new_expression') return false;
+	if (!newExpression?.is('new_expression')) return false;
 
 	const ctor = newExpression.field('constructor');
 	if (!ctor) return false;
@@ -203,16 +201,16 @@ function isStreamOptionsMember(member: SgNode<Js>, streamNames: Set<string>,): b
 }
 
 //main transromation is done here.
-function transformStream({ fn, name }: StreamFunction, context: FileContext,): Edit | null {
+function transformStream({ fn, name }: StreamFunction, context: FileContext): Edit | null {
 	const fnChildren = fn.children();
 
-	const asyncToken = fnChildren.find((child) => child.kind() === 'async');
+	const asyncToken = fnChildren.find((child) => child.is('async'));
 	if (!asyncToken) return null;
 
-	if (fnChildren.some((child) => child.kind() === '*')) return null;
+	if (fnChildren.some((child) => child.is('*'))) return null;
 
 	const body = fn.field('body');
-	if (body?.kind() !== 'statement_block') return null;
+	if (!body?.is('statement_block')) return null;
 
 	const awaits = body
 		.findAll({ rule: { kind: 'await_expression' } })
@@ -274,30 +272,9 @@ function transformStream({ fn, name }: StreamFunction, context: FileContext,): E
 
 	// Inlined indentation logic using the provided getLineIndent util
 	const bodyRange = rangeOf(body);
-	const statementStart = rangeOf(topLevelIn(body, statements[0])).start;
 	const closingIndent = getLineIndent(context.source, bodyRange.end - 1);
-
-	const sliceStr = context.source.slice(
-		Math.min(bodyRange.start, statementStart),
-		Math.max(bodyRange.start, statementStart)
-	);
-
-	const isOnSameLine = !sliceStr.includes('\n');
-
-	let bodyIndent: string;
-	let unit: string;
-
-	if (!isOnSameLine) {
-		bodyIndent = getLineIndent(context.source, statementStart);
-		unit = (bodyIndent.length > closingIndent.length && bodyIndent.startsWith(closingIndent))
-			? bodyIndent.slice(closingIndent.length)
-			: context.indentUnit;
-	} else {
-		unit = context.indentUnit;
-		bodyIndent = closingIndent + unit;
-	}
-
-	const chainIndent = bodyIndent + unit;
+	const bodyIndent = closingIndent + context.indentUnit;
+	const chainIndent = bodyIndent + context.indentUnit;
 
 	const lines: string[] = comments.map(
 		(c) => `${bodyIndent}${c.text().trim()}`,
@@ -320,11 +297,10 @@ function transformStream({ fn, name }: StreamFunction, context: FileContext,): E
 
 	lines.push(`${chainIndent}.catch(${errorName} => ${errorHandler});`);
 
-	const { eol } = context;
 	const replacements: Replacement[] = [
 		{
 			...bodyRange,
-			text: `{${eol}${lines.join(eol)}${eol}${closingIndent}}`,
+			text: `{${EOL}${lines.join(EOL)}${EOL}${closingIndent}}`,
 		},
 		removeToken(asyncToken, context.source),
 	];
@@ -343,7 +319,7 @@ function extractBody(body: SgNode<Js>): ExtractedBody | null {
 	const statements = getStatements(body);
 	const comments = getComments(body);
 
-	if (statements.length === 1 && statements[0].kind() === 'try_statement') {
+	if (statements.length === 1 && statements[0].is('try_statement')) {
 		const tryStmt = statements[0];
 
 		if (tryStmt.field('finalizer')) {
@@ -357,7 +333,7 @@ function extractBody(body: SgNode<Js>): ExtractedBody | null {
 
 		const parameter = handler.field('parameter');
 
-		if (parameter?.kind() !== 'identifier') return null;
+		if (!parameter?.is('identifier')) return null;
 
 		const handlerBody = handler.field('body');
 		if (!handlerBody) return null;
@@ -383,24 +359,23 @@ function extractBody(body: SgNode<Js>): ExtractedBody | null {
 function getStep(statement: SgNode<Js>): Step | null {
 	let awaitedNode: SgNode<Js> | null = null;
 	let boundName: SgNode<Js> | null = null;
-	const kind = statement.kind();
 
-	if (kind === 'expression_statement') {
+	if (statement.is('expression_statement')) {
 		awaitedNode = statement.child(0) ?? null;
-	} else if (kind === 'lexical_declaration' || kind === 'variable_declaration') {
+	} else if (statement.is('lexical_declaration') || statement.is('variable_declaration')) {
 		const decls = statement
 			.children()
-			.filter((child) => child.kind() === 'variable_declarator');
+			.filter((child) => child.is('variable_declarator'));
 
 		if (decls.length !== 1) return null;
 
 		awaitedNode = decls[0].field('value') ?? null;
 		boundName = decls[0].field('name') ?? null;
 	}
-	if (awaitedNode?.kind() !== 'await_expression') return null;
+	if (!awaitedNode?.is('await_expression')) return null;
 	const argument = awaitedNode
 		.children()
-		.find((c) => c.kind() !== 'await' && c.kind() !== 'comment');
+		.find((c) => !c.is('await') && !c.is('comment'));
 
 	if (!argument) return null;
 	return { statement, argument, name: boundName };
@@ -418,13 +393,11 @@ function getCallbackParamName(fn: SgNode<Js>): string | null {
 	const last = list[list.length - 1];
 	if (!last) return null;
 
-	const kind = last.kind();
+	if (last.is('identifier')) return last.text();
 
-	if (kind === 'identifier') return last.text();
-
-	if (kind === 'required_parameter' || kind === 'optional_parameter') {
+	if (last.is('required_parameter') || last.is('optional_parameter')) {
 		const pattern = last.child(0);
-		return pattern?.kind() === 'identifier' ? pattern.text() : null;
+		return pattern?.is('identifier') ? pattern.text() : null;
 	}
 	return null;
 }
@@ -435,9 +408,7 @@ const withoutSpaces = (text: string) => text.replace(/\s+/g, '');
 
 //get call expression from statement
 function getStatementCall(statement: SgNode<Js>): SgNode<Js> | null {
-	const kind = statement.kind();
-
-	if (kind !== 'expression_statement' && kind !== 'return_statement') {
+	if (!statement.is('expression_statement') && !statement.is('return_statement')) {
 		return null;
 	}
 
@@ -445,7 +416,7 @@ function getStatementCall(statement: SgNode<Js>): SgNode<Js> | null {
 		.children()
 		.find((c) => !['return', ';', 'comment'].includes(c.kind()));
 
-	return call?.kind() === 'call_expression' ? call : null;
+	return call?.is('call_expression') ? call : null;
 }
 
 //check if call uses expected callee
@@ -463,12 +434,12 @@ function getCallWithCallee(
 const getCallbackCall = (statement: SgNode<Js>, cbName: string) =>
 	getCallWithCallee(
 		statement,
-		(callee) => callee.kind() === 'identifier' && callee.text() === cbName,
+		(callee) => callee.is('identifier') && callee.text() === cbName,
 	);
 
 //find this.push call from statement
 const getPushCall = (statement: SgNode<Js>) =>
-	statement.kind() === 'expression_statement'
+	statement.is('expression_statement')
 		? getCallWithCallee(
 			statement,
 			(callee) => withoutSpaces(callee.text()) === 'this.push',
@@ -477,7 +448,7 @@ const getPushCall = (statement: SgNode<Js>) =>
 
 //check if statement is expected call
 function isCallStatement(statement: SgNode<Js>, expected: string): boolean {
-	if (statement.kind() !== 'expression_statement') return false;
+	if (!statement.is('expression_statement')) return false;
 
 	const call = getStatementCall(statement);
 
@@ -507,7 +478,7 @@ function hasSafeScoping(steps: Step[], finalStatement: SgNode<Js>): boolean {
 
 //get variables bound by a node
 function getBoundNames(name: SgNode<Js>): string[] {
-	if (name.kind() === 'identifier') return [name.text()];
+	if (name.is('identifier')) return [name.text()];
 
 	return name
 		.findAll({
@@ -543,7 +514,7 @@ function getArrowParameter(step: Step, consumer: SgNode<Js>): string {
 		return '()';
 	}
 
-	if (step.name.kind() === 'identifier') {
+	if (step.name.is('identifier')) {
 		return step.name.text();
 	}
 	return `(${step.name.text()})`;
@@ -578,12 +549,12 @@ function belongsTo(node: SgNode<Js>, fn: SgNode<Js>): boolean {
 function getStatements(block: SgNode<Js>): SgNode<Js>[] {
 	return block
 		.children()
-		.filter((c) => !['{', '}', 'comment'].includes(c.kind()));
+		.filter((c) => !c.is('{') && !c.is('}') && !c.is('comment'));
 }
 
 //get comments directly inside block
 function getComments(block: SgNode<Js>): SgNode<Js>[] {
-	return block.children().filter((c) => c.kind() === 'comment');
+	return block.children().filter((c) => c.is('comment'));
 }
 
 //get source range of node
@@ -631,14 +602,4 @@ function applyReplacements(fn: SgNode<Js>, reps: Replacement[],): string {
 		text = text.slice(0, r.start - base) + r.text + text.slice(r.end - base);
 	}
 	return text;
-}
-
-//find top level statement inside block
-function topLevelIn(block: SgNode<Js>, node: SgNode<Js>): SgNode<Js> {
-	let current: SgNode<Js> = node;
-
-	while (current.parent() && !sameRange(current.parent() as SgNode<Js>, block)) {
-		current = current.parent() as SgNode<Js>;
-	}
-	return current;
 }
